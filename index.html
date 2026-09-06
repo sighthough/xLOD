@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mesh LOD vs. Hybrid xLOD Engine (Matched Lighting)</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+    }
+    body {
+      background-color: #0d0e12;
+      color: #e0e6ed;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background: #141721;
+      padding: 10px 20px;
+      border-bottom: 1px solid #232838;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 10;
+    }
+    header h1 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #4f9cf9;
+    }
+    header p {
+      font-size: 0.8rem;
+      color: #8a99ad;
+    }
+    #demo-container {
+      flex: 1;
+      display: flex;
+      width: 100vw;
+      height: calc(100vh - 45px);
+      position: relative;
+    }
+    .viewport-box {
+      flex: 1;
+      height: 100%;
+      position: relative;
+      border-right: 1px solid #232838;
+    }
+    .viewport-box:last-child {
+      border-right: none;
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .viewport-label {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(15, 18, 25, 0.85);
+      border: 1px solid #2d3548;
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      pointer-events: none;
+      backdrop-filter: blur(4px);
+    }
+    .xlod-theme {
+      color: #00ffcc;
+      border-color: #00ffcc44;
+    }
+    .hud-stats {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      background: rgba(15, 18, 25, 0.85);
+      border: 1px solid #2d3548;
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 0.75rem;
+      line-height: 1.5;
+      pointer-events: none;
+    }
+    .hud-stats span {
+      color: #4f9cf9;
+      font-weight: bold;
+    }
+    .xlod-stats span {
+      color: #00ffcc;
+    }
+    .lil-gui {
+      --background-color: rgba(20, 23, 33, 0.92) !important;
+      --text-color: #d1d9e6 !important;
+      --title-background-color: #1c2230 !important;
+      --widget-color: #2a3245 !important;
+      --hover-color: #3b4660 !important;
+      --focus-color: #00ffcc !important;
+      --number-color: #00ffcc !important;
+      --string-color: #00ffcc !important;
+      border-radius: 6px !important;
+      border: 1px solid #2d3548 !important;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5) !important;
+    }
+  </style>
+
+  <!-- Three.js, OrbitControls & lil-gui -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.18"></script>
+</head>
+<body>
+
+  <header>
+    <div>
+      <h1>Mesh LOD vs. Hybrid xLOD Engine</h1>
+      <p>Identical Baseline Lighting Shaders Across Both Viewports</p>
+    </div>
+  </header>
+
+  <div id="demo-container">
+    <!-- Left Viewport -->
+    <div class="viewport-box" id="box-left">
+      <div class="viewport-label">Mesh LOD Only (32-bit FP32 Baseline)</div>
+      <div class="hud-stats" id="hud-left">
+        Mesh LOD: <span id="stat-left-lod">Active</span><br>
+        Math Precision: <span>32-bit (FP32)</span><br>
+        Lighting Shader: <span>Full Precision</span>
+      </div>
+    </div>
+
+    <!-- Right Viewport -->
+    <div class="viewport-box" id="box-right">
+      <div class="viewport-label xlod-theme">Hybrid xLOD (Mesh LOD + Precision Gating)</div>
+      <div class="hud-stats xlod-stats" id="hud-right">
+        Mesh LOD: <span id="stat-right-lod">Active</span><br>
+        Math Precision: <span id="stat-right-bits">Dynamic</span><br>
+        Est. Math Savings: <span id="stat-right-savings">0%</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // --- UNIFIED GLSL SHADER (USED BY BOTH VIEWPORTS FOR 100% LIGHTING PARITY) ---
+    const xlodVertexShader = `
+      uniform float uXlodEnabled;
+      uniform float uStartDist;
+      uniform float uEndDist;
+      uniform float uMinBits;
+      uniform float uGateVertices;
+
+      varying vec3 vNormal;
+      varying vec3 vWorldPosition;
+
+      float truncateScalar(float val, float levels) {
+        if (levels >= 256.0) return val;
+        return floor(val * levels + 0.5) / levels;
+      }
+
+      vec3 truncateVec3(vec3 v, float levels) {
+        return vec3(
+          truncateScalar(v.x, levels),
+          truncateScalar(v.y, levels),
+          truncateScalar(v.z, levels)
+        );
+      }
+
+      void main() {
+        vec3 localPos = position;
+        vec4 worldPos = modelMatrix * vec4(localPos, 1.0);
+        float dist = distance(worldPos.xyz, cameraPosition);
+
+        float t = clamp((dist - uStartDist) / (uEndDist - uStartDist), 0.0, 1.0);
+        float currentLevels = mix(256.0, pow(2.0, uMinBits), t);
+
+        if (uXlodEnabled > 0.5 && uGateVertices > 0.5) {
+          localPos = truncateVec3(localPos, currentLevels);
+        }
+
+        worldPos = modelMatrix * vec4(localPos, 1.0);
+        vWorldPosition = worldPos.xyz;
+        vNormal = normalMatrix * normal;
+        gl_Position = projectionMatrix * viewMatrix * worldPos;
+      }
+    `;
+
+    const xlodFragmentShader = `
+      uniform float uXlodEnabled;
+      uniform float uStartDist;
+      uniform float uEndDist;
+      uniform float uMinBits;
+      uniform float uGateLighting;
+      uniform float uShowHeatmap;
+      uniform vec3 uLightPos;
+      uniform vec3 uObjectColor;
+
+      varying vec3 vNormal;
+      varying vec3 vWorldPosition;
+
+      float truncateScalar(float val, float levels) {
+        if (levels >= 256.0) return val;
+        return floor(val * levels + 0.5) / levels;
+      }
+
+      void main() {
+        vec3 norm = normalize(vNormal);
+        vec3 lightDir = normalize(uLightPos - vWorldPosition);
+        
+        float dist = distance(vWorldPosition, cameraPosition);
+        float t = clamp((dist - uStartDist) / (uEndDist - uStartDist), 0.0, 1.0);
+        float currentLevels = mix(256.0, pow(2.0, uMinBits), t);
+
+        // Blinn-Phong Diffuse
+        float diff = max(dot(norm, lightDir), 0.0);
+
+        // Blinn-Phong Specular
+        vec3 viewDir = normalize(cameraPosition - vWorldPosition);
+        vec3 halfDir = normalize(lightDir + viewDir);
+        float spec = pow(max(dot(norm, halfDir), 0.0), 32.0);
+
+        // Truncate only if xLOD precision gating is explicitly active
+        if (uXlodEnabled > 0.5 && uGateLighting > 0.5) {
+          diff = truncateScalar(diff, currentLevels);
+          spec = truncateScalar(spec, max(currentLevels * 0.5, 2.0));
+        }
+
+        vec3 ambient = vec3(0.12) * uObjectColor;
+        vec3 diffuse = diff * uObjectColor * 0.85;
+        vec3 specular = vec3(1.0) * spec * 0.4;
+        vec3 finalColor = ambient + diffuse + specular;
+
+        // Visual Precision Heatmap
+        if (uShowHeatmap > 0.5 && uXlodEnabled > 0.5) {
+          vec3 heatmapColor = mix(vec3(0.0, 1.0, 0.3), vec3(1.0, 0.05, 0.1), t);
+          finalColor = mix(finalColor, heatmapColor, 0.65);
+        }
+
+        gl_FragColor = vec4(finalColor, 1.0);
+      }
+    `;
+
+    // --- CONFIGURATION ---
+    const params = {
+      meshLodEnabled: true,
+      lodMidDist: 25,
+      lodFarDist: 50,
+
+      xlodEnabled: true,
+      gateVertices: true,
+      gateLighting: true,
+      showHeatmap: false,
+      arithStartDist: 15,
+      arithEndDist: 80,
+      farBits: 3,
+
+      objectCount: 120,
+      fieldDepth: 120,
+      rotationSpeed: 0.5,
+      wireframe: false,
+      cameraDist: 45,
+      autoRotate: true
+    };
+
+    const containerLeft = document.getElementById('box-left');
+    const containerRight = document.getElementById('box-right');
+
+    function createPipeline(container) {
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0a0c10);
+      scene.fog = new THREE.FogExp2(0x0a0c10, 0.008);
+
+      const camera = new THREE.PerspectiveCamera(55, container.clientWidth / container.clientHeight, 0.1, 300);
+      camera.position.set(0, 15, params.cameraDist);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      container.appendChild(renderer.domElement);
+
+      const controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+
+      return { scene, camera, renderer, controls };
+    }
+
+    const left = createPipeline(containerLeft);
+    const right = createPipeline(containerRight);
+
+    // Sync camera movement
+    left.controls.addEventListener('change', () => {
+      right.camera.position.copy(left.camera.position);
+      right.camera.rotation.copy(left.camera.rotation);
+      right.controls.target.copy(left.controls.target);
+    });
+
+    const lightPos = new THREE.Vector3(30, 50, 40);
+
+    // UNIFORMS FOR LEFT VIEWPORT (Precision Gating Permanently Locked Off)
+    const leftShaderUniforms = {
+      uXlodEnabled: { value: 0.0 }, // ALWAYS OFF (Baseline FP32)
+      uStartDist: { value: params.arithStartDist },
+      uEndDist: { value: params.arithEndDist },
+      uMinBits: { value: params.farBits },
+      uGateVertices: { value: 0.0 },
+      uGateLighting: { value: 0.0 },
+      uShowHeatmap: { value: 0.0 },
+      uLightPos: { value: lightPos },
+      uObjectColor: { value: new THREE.Color(0x3a86ff) }
+    };
+
+    // UNIFORMS FOR RIGHT VIEWPORT (Dynamic Precision Gating)
+    const rightShaderUniforms = {
+      uXlodEnabled: { value: 1.0 },
+      uStartDist: { value: params.arithStartDist },
+      uEndDist: { value: params.arithEndDist },
+      uMinBits: { value: params.farBits },
+      uGateVertices: { value: 1.0 },
+      uGateLighting: { value: 1.0 },
+      uShowHeatmap: { value: 0.0 },
+      uLightPos: { value: lightPos },
+      uObjectColor: { value: new THREE.Color(0x3a86ff) }
+    };
+
+    const leftShaderMaterial = new THREE.ShaderMaterial({
+      vertexShader: xlodVertexShader,
+      fragmentShader: xlodFragmentShader,
+      uniforms: leftShaderUniforms,
+      wireframe: params.wireframe
+    });
+
+    const rightShaderMaterial = new THREE.ShaderMaterial({
+      vertexShader: xlodVertexShader,
+      fragmentShader: xlodFragmentShader,
+      uniforms: rightShaderUniforms,
+      wireframe: params.wireframe
+    });
+
+    // --- MESH GEOMETRY DEFINITIONS ---
+    const geoPairs = [
+      {
+        high: new THREE.TorusKnotGeometry(1.2, 0.35, 128, 32),
+        med:  new THREE.TorusKnotGeometry(1.2, 0.35, 32, 12),
+        low:  new THREE.TorusKnotGeometry(1.2, 0.35, 12, 6)
+      },
+      {
+        high: new THREE.IcosahedronGeometry(1.8, 3),
+        med:  new THREE.IcosahedronGeometry(1.8, 1),
+        low:  new THREE.IcosahedronGeometry(1.8, 0)
+      },
+      {
+        high: new THREE.CylinderGeometry(1.2, 1.2, 3, 32, 8),
+        med:  new THREE.CylinderGeometry(1.2, 1.2, 3, 12, 2),
+        low:  new THREE.CylinderGeometry(1.2, 1.2, 3, 6, 1)
+      }
+    ];
+
+    let lodObjectsLeft = [];
+    let lodObjectsRight = [];
+    const groupLeft = new THREE.Group();
+    const groupRight = new THREE.Group();
+
+    left.scene.add(groupLeft);
+    right.scene.add(groupRight);
+
+    function populateScenes() {
+      while(groupLeft.children.length > 0) groupLeft.remove(groupLeft.children[0]);
+      while(groupRight.children.length > 0) groupRight.remove(groupRight.children[0]);
+      lodObjectsLeft = [];
+      lodObjectsRight = [];
+
+      for (let i = 0; i < params.objectCount; i++) {
+        const pair = geoPairs[i % geoPairs.length];
+
+        const x = (Math.sin(i * 99) * 2 - 1) * 22;
+        const y = (Math.cos(i * 33) * 2 - 1) * 15;
+        const z = -(i / params.objectCount) * params.fieldDepth + 10;
+        const scale = 0.7 + (Math.abs(Math.sin(i)) * 0.8);
+
+        // LEFT VIEWPORT (Baseline Shader Material)
+        const lodL = new THREE.LOD();
+        const mL_High = new THREE.Mesh(pair.high, leftShaderMaterial);
+        const mL_Med  = new THREE.Mesh(pair.med, leftShaderMaterial);
+        const mL_Low  = new THREE.Mesh(pair.low, leftShaderMaterial);
+
+        [mL_High, mL_Med, mL_Low].forEach(m => m.scale.setScalar(scale));
+
+        if (params.meshLodEnabled) {
+          lodL.addLevel(mL_High, 0);
+          lodL.addLevel(mL_Med, params.lodMidDist);
+          lodL.addLevel(mL_Low, params.lodFarDist);
+        } else {
+          lodL.addLevel(mL_High, 0);
+        }
+        lodL.position.set(x, y, z);
+        groupLeft.add(lodL);
+        lodObjectsLeft.push(lodL);
+
+        // RIGHT VIEWPORT (xLOD Shader Material)
+        const lodR = new THREE.LOD();
+        const mR_High = new THREE.Mesh(pair.high, rightShaderMaterial);
+        const mR_Med  = new THREE.Mesh(pair.med, rightShaderMaterial);
+        const mR_Low  = new THREE.Mesh(pair.low, rightShaderMaterial);
+
+        [mR_High, mR_Med, mR_Low].forEach(m => m.scale.setScalar(scale));
+
+        if (params.meshLodEnabled) {
+          lodR.addLevel(mR_High, 0);
+          lodR.addLevel(mR_Med, params.lodMidDist);
+          lodR.addLevel(mR_Low, params.lodFarDist);
+        } else {
+          lodR.addLevel(mR_High, 0);
+        }
+        lodR.position.set(x, y, z);
+        groupRight.add(lodR);
+        lodObjectsRight.push(lodR);
+      }
+    }
+
+    populateScenes();
+
+    // --- GUI ---
+    const gui = new lil.GUI({ title: 'Engine Controls' });
+
+    const fMeshLod = gui.addFolder('1. Conventional Mesh LOD');
+    fMeshLod.add(params, 'meshLodEnabled').name('Enable Mesh LOD').onChange(populateScenes);
+    fMeshLod.add(params, 'lodMidDist', 10, 40, 1).name('Medium Poly Dist (m)').onChange(populateScenes);
+    fMeshLod.add(params, 'lodFarDist', 30, 90, 1).name('Low Poly Dist (m)').onChange(populateScenes);
+
+    const fXlod = gui.addFolder('2. xLOD Arithmetic Precision');
+    fXlod.add(params, 'xlodEnabled').name('Enable Precision Gating').onChange(v => rightShaderUniforms.uXlodEnabled.value = v ? 1 : 0);
+    fXlod.add(params, 'gateVertices').name('Gate Vertices').onChange(v => rightShaderUniforms.uGateVertices.value = v ? 1 : 0);
+    fXlod.add(params, 'gateLighting').name('Gate Shading').onChange(v => rightShaderUniforms.uGateLighting.value = v ? 1 : 0);
+    fXlod.add(params, 'showHeatmap').name('Precision Heatmap').onChange(v => rightShaderUniforms.uShowHeatmap.value = v ? 1 : 0);
+    fXlod.add(params, 'arithStartDist', 5, 50, 1).name('Gate Start Dist (m)').onChange(v => {
+      leftShaderUniforms.uStartDist.value = v;
+      rightShaderUniforms.uStartDist.value = v;
+    });
+    fXlod.add(params, 'arithEndDist', 40, 140, 1).name('Gate Max Dist (m)').onChange(v => {
+      leftShaderUniforms.uEndDist.value = v;
+      rightShaderUniforms.uEndDist.value = v;
+    });
+    fXlod.add(params, 'farBits', 1, 8, 1).name('Far Bit Width').onChange(v => rightShaderUniforms.uMinBits.value = v);
+
+    const fScene = gui.addFolder('Scene Settings');
+    fScene.add(params, 'objectCount', 30, 250, 10).name('Object Count').onChange(populateScenes);
+    fScene.add(params, 'fieldDepth', 50, 180, 10).name('Field Depth').onChange(populateScenes);
+    fScene.add(params, 'wireframe').name('Wireframe').onChange(v => {
+      leftShaderMaterial.wireframe = v;
+      rightShaderMaterial.wireframe = v;
+    });
+    fScene.add(params, 'autoRotate').name('Auto-Rotate');
+
+    // --- TELEMETRY ---
+    const statLeftLod = document.getElementById('stat-left-lod');
+    const statRightLod = document.getElementById('stat-right-lod');
+    const statRightBits = document.getElementById('stat-right-bits');
+    const statRightSavings = document.getElementById('stat-right-savings');
+
+    function updateStats() {
+      statLeftLod.textContent = params.meshLodEnabled ? 'Active (High/Med/Low)' : 'Disabled (High Only)';
+      statRightLod.textContent = params.meshLodEnabled ? 'Active (High/Med/Low)' : 'Disabled (High Only)';
+
+      let totalMaxBits = lodObjectsRight.length * 32;
+      let totalActiveBits = 0;
+      const camPos = right.camera.position;
+
+      lodObjectsRight.forEach(lod => {
+        const d = lod.position.distanceTo(camPos);
+        const t = Math.min(Math.max((d - params.arithStartDist) / (params.arithEndDist - params.arithStartDist), 0.0), 1.0);
+        const activeBits = params.xlodEnabled ? (32 - (t * (32 - params.farBits))) : 32;
+        totalActiveBits += activeBits;
+      });
+
+      const avgBits = totalActiveBits / lodObjectsRight.length;
+      const mathSavingsPct = (1.0 - (totalActiveBits / totalMaxBits)) * 100;
+
+      statRightBits.textContent = params.xlodEnabled ? `~${avgBits.toFixed(1)}-bit` : '32-bit (FP32)';
+      statRightSavings.textContent = `${mathSavingsPct.toFixed(1)}% (Math) + Mesh LOD`;
+    }
+
+    // --- ANIMATION LOOP ---
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+      const time = clock.getElapsedTime();
+
+      lodObjectsLeft.forEach(lod => lod.update(left.camera));
+      lodObjectsRight.forEach(lod => lod.update(right.camera));
+
+      const rotAmount = delta * params.rotationSpeed;
+      lodObjectsLeft.forEach((lod, idx) => {
+        lod.rotation.x += rotAmount * (idx % 2 === 0 ? 1 : -1);
+        lod.rotation.y += rotAmount * 0.5;
+        lodObjectsRight[idx].rotation.x = lod.rotation.x;
+        lodObjectsRight[idx].rotation.y = lod.rotation.y;
+      });
+
+      if (params.autoRotate) {
+        const radius = params.cameraDist;
+        const camX = Math.sin(time * 0.15 * params.rotationSpeed) * radius;
+        const camZ = Math.cos(time * 0.15 * params.rotationSpeed) * radius;
+        left.camera.position.x = camX;
+        left.camera.position.z = camZ;
+        left.camera.lookAt(0, 0, -params.fieldDepth * 0.4);
+
+        right.camera.position.copy(left.camera.position);
+        right.camera.lookAt(0, 0, -params.fieldDepth * 0.4);
+      }
+
+      left.controls.update();
+      right.controls.update();
+
+      left.renderer.render(left.scene, left.camera);
+      right.renderer.render(right.scene, right.camera);
+
+      updateStats();
+    }
+
+    window.addEventListener('resize', () => {
+      [left, right].forEach((pipeline, idx) => {
+        const container = idx === 0 ? containerLeft : containerRight;
+        pipeline.camera.aspect = container.clientWidth / container.clientHeight;
+        pipeline.camera.updateProjectionMatrix();
+        pipeline.renderer.setSize(container.clientWidth, container.clientHeight);
+      });
+    });
+
+    animate();
+  </script>
+</body>
+</html>

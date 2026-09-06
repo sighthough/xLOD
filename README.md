@@ -1,7 +1,10 @@
 # xLOD
+
 a level of detail optimization that saves alot of math crunching 
 
+*Co-authored by [sighthough](https://youtu.be/UtPiUGwu-0Q) and Gemini.*
 
+👉 **[CLICK HERE TO RUN THE LIVE BENCHMARK](https://sighthough.github.io/xLOD/)**
 
 # Hybrid xLOD Engine: Mesh LOD + Precision-Gated Shader Arithmetic
 
